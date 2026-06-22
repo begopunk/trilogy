@@ -1,0 +1,9 @@
+test_gsheet_connection.py
+_test_gsheet*.py
+*.log
+*.tmp
+.env
+__pycache__/
+*.pyc
+service_account.json
+bot_data.json

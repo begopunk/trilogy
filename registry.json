@@ -1,0 +1,7 @@
+{
+    "boss_timer": {
+        "name": "🏰 Clan Boss Timer Bot",
+        "script": "boss_time.py",
+        "description": "Bot pengingat spawn boss Lineage 2M & Notifikasi Suara VC."
+    }
+}

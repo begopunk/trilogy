@@ -1,0 +1,9 @@
+discord.py
+pyTelegramBotAPI
+Flask
+yt-dlp
+python-dotenv
+psutil
+waitress
+gspread
+google-auth
