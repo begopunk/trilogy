@@ -4,3 +4,4 @@ PyNaCl
 yt-dlp
 python-dotenv
 psutil
+pyTelegramBotAPI
