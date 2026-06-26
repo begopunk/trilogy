@@ -1777,13 +1777,14 @@ async def on_ready():
         telebot_started = True
 
     # 🚀 Memulai Flask Dashboard di Thread terpisah
-    log.info("🌐 Menjalankan Web Dashboard pada http://localhost:5000 (Akses Lokal)")
+    port = int(os.getenv("PORT", 5000))
+    log.info(f"🌐 Menjalankan Web Dashboard pada port {port}")
     try:
         from waitress import serve
-        Thread(target=lambda: serve(app, host='0.0.0.0', port=5000), daemon=True).start()
+        Thread(target=lambda: serve(app, host='0.0.0.0', port=port), daemon=True).start()
     except ImportError:
         log.warning("⚠️ Library 'waitress' tidak ditemukan. Menggunakan server standar.")
-        Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False), daemon=True).start()
+        Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
