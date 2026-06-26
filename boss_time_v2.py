@@ -13,12 +13,10 @@ import subprocess
 import difflib
 import psutil
 import random
-from flask import Flask, render_template, jsonify, request
 from logging.handlers import RotatingFileHandler
 import telebot  # Library Telegram Bot
 import yt_dlp  # Engine Jukebox Pengunduh Musik YouTube
 from dotenv import load_dotenv  # Library untuk membaca file .env
-from threading import Thread
 
 # 📦 IMPORT DATA BOSS DARI FILE TERPISAH
 from boss_data import BOSS_DATA
@@ -54,8 +52,13 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID") # ID Spreadsheet untuk database
 
 # --- INITIALIZE TELEGRAM BOT ---
 tele_bot = telebot.TeleBot(TELEGRAM_TOKEN)
+try:
+    tele_bot.remove_webhook()
+except Exception:
+    pass
+if hasattr(tele_bot, "skip_pending"):
+    tele_bot.skip_pending = True
 
-app = Flask(__name__)
 # --- KONFIGURASI UTAMA ---
 TZ_GMT8 = timezone(timedelta(hours=8))
 
@@ -80,7 +83,6 @@ last_code_mtime = 0
 db_lock = threading.RLock() # Re-entrant Lock untuk mencegah deadlock saat auto-reset database
 telebot_started = False
 telebot_active = True # Flag untuk mengontrol loop polling Telegram
-web_voice_muted = False
 pending_update_notice = False
 
 # --- DISCORD JUKEBOX STATE ---
@@ -122,7 +124,7 @@ _creds_lock = threading.Lock()
 _cached_creds = None
 
 def load_data():
-    global boss_logs, boss_status, user_timezones, target_channel_id, telegram_chat_id, last_db_mtime, notif_sent, web_voice_muted
+    global boss_logs, boss_status, user_timezones, target_channel_id, telegram_chat_id, last_db_mtime, notif_sent
     
     data = None
     if os.path.exists(DATA_FILE):
@@ -140,7 +142,6 @@ def load_data():
                 user_timezones = data.get("user_timezones", {})
                 target_channel_id = data.get("target_channel_id", None)
                 telegram_chat_id = data.get("telegram_chat_id", None)
-                web_voice_muted = data.get("web_voice_muted", False)
                 notif_sent = data.get("notif_sent", {})
                 
                 saved_status = data.get("boss_status", {})
@@ -168,7 +169,6 @@ def save_data():
             "user_timezones": user_timezones,
             "target_channel_id": target_channel_id,
             "telegram_chat_id": telegram_chat_id,
-            "web_voice_muted": web_voice_muted,
             "notif_sent": notif_sent
         }
         json_string = json.dumps(data_to_save, indent=4, ensure_ascii=False)
@@ -1264,7 +1264,29 @@ def run_telegram_polling():
     print("🤖 Polling Telegram Aktif Terkendali...")
     while telebot_active:
         try:
-            tele_bot.infinity_polling(timeout=60, long_polling_timeout=30) # Blocking call, tapi di thread terpisah
+            try:
+                tele_bot.remove_webhook()
+            except Exception:
+                pass
+
+            if hasattr(tele_bot, "skip_pending"):
+                tele_bot.skip_pending = True
+
+            tele_bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        except telebot.apihelper.ApiTelegramException as e:
+            if not telebot_active:
+                break
+            error_code = None
+            try:
+                error_code = e.result_json.get("error_code") if hasattr(e, "result_json") and e.result_json else None
+            except Exception:
+                error_code = None
+            if error_code == 409 or "Conflict" in str(e):
+                log.info("ℹ️ Telegram: Konflik getUpdates terdeteksi, menunggu sebelum mencoba ulang...")
+                time.sleep(10)
+                continue
+            log.warning(f"⚠️ Telegram polling terhenti, mencoba ulang: {e}")
+            time.sleep(5)
         except Exception as e:
             if not telebot_active:
                 break
@@ -1279,7 +1301,7 @@ def run_telegram_polling():
 async def check_boss_timer():
     global target_channel_id, last_db_mtime
     
-    # 🔄 Sinkronisasi otomatis jika file bot_data.json diubah oleh proses lain (seperti Flask Dashboard)
+    # 🔄 Sinkronisasi otomatis jika file bot_data.json diubah oleh proses lain
     if os.path.exists(DATA_FILE):
         try: # Pengecekan modifikasi file
             current_mtime = os.path.getmtime(DATA_FILE)
@@ -1373,8 +1395,7 @@ async def system_heartbeat():
             f"🕒 Waktu: <code>{waktu_sekarang} WITA</code>\n"
             f"✅ Status: <b>Online & Monitoring</b>\n"
             f"💾 Database: <code>{boss_count} Boss Aktif</code>\n"
-            f"💽 Sisa Disk: <code>{disk_free} GB</code>\n"
-            f"🌐 Dashboard: <code>Aktif di Port 5000</code>"
+            f"💽 Sisa Disk: <code>{disk_free} GB</code>"
         )
         try:
             bot.loop.run_in_executor(None, lambda: tele_bot.send_message(telegram_chat_id, msg, parse_mode="HTML"))
@@ -1382,90 +1403,6 @@ async def system_heartbeat():
 
 
 # ==============================================================================
-# 🌐 INTEGRATED WEB DASHBOARD (FLASK ROUTES)
-# ==============================================================================
-
-@app.route('/')
-def index():
-    formatted_data = []
-    with db_lock: # Pastikan akses ke data global aman
-        for name, interval in BOSS_DATA.items():
-            log_entry = boss_logs.get(name, {})
-            formatted_data.append({
-                "name": name,
-                "cooldown": interval,
-                "last_kill": log_entry.get("waktu_mati", "-"),
-                "reporter": log_entry.get("user", "System"),
-                "next_spawn_iso": boss_status.get(name).isoformat() if name in boss_status else None
-            })
-    return render_template('Index.html', formatted_data=formatted_data, web_voice_muted=web_voice_muted)
-
-@app.route('/api/bosses')
-def api_bosses():
-    data = []
-    with db_lock: # Pastikan akses ke data global aman
-        for name, interval in BOSS_DATA.items():
-            data.append({
-                "name": name, "cooldown": interval,
-                "next_spawn_iso": boss_status.get(name).isoformat() if name in boss_status else None
-            })
-    return jsonify(data)
-
-@app.route('/api/report-death', methods=['POST'])
-def report_death():
-    payload = request.get_json(silent=True)
-    if not payload: return jsonify({"success": False}), 400
-    
-    boss_name = payload.get("boss_name", "").lower().strip()
-    if boss_name not in BOSS_DATA: return jsonify({"success": False}), 400
-
-    reporter = payload.get("reporter", "Web Dashboard")
-    
-    # Cek apakah ada input waktu manual dari dashboard
-    manual_time_str = payload.get("death_time")
-    if manual_time_str:
-        try:
-            # Format dari HTML datetime-local adalah YYYY-MM-DDTHH:MM
-            input_dt = datetime.fromisoformat(manual_time_str)
-            # Tambahkan timezone jika belum ada
-            if input_dt.tzinfo is None:
-                now_gmt8 = input_dt.replace(tzinfo=TZ_GMT8)
-            else:
-                now_gmt8 = input_dt.astimezone(TZ_GMT8)
-        except Exception as e:
-            log.warning(f"Format manual death_time salah: {e}. Menggunakan waktu sekarang.")
-            now_gmt8 = datetime.now(TZ_GMT8)
-    else:
-        now_gmt8 = datetime.now(TZ_GMT8)
-
-    interval_jam = BOSS_DATA[boss_name]
-    next_spawn = now_gmt8 + timedelta(hours=interval_jam)
-
-    with db_lock: # Pastikan akses ke data global aman
-        # Update Shared Global Memory secara atomik
-        boss_status[boss_name] = next_spawn
-        notif_sent[boss_name] = {"5m": False, "1m": False, "spawn": False}
-        boss_logs[boss_name] = {
-            "user": reporter,
-            "waktu_mati": now_gmt8.strftime("%H:%M (Web Report)"),
-            "waktu_input": now_gmt8.strftime("%d-%m %H:%M")
-        }
-        save_data()
-
-    if telegram_chat_id:
-        tele_msg = f"🌐 <b>[WEB REPORT]</b>\n👤 <b>{reporter}</b> melaporkan boss <b>{boss_name.upper()}</b> mati.\n⏳ Next: <code>{next_spawn.strftime('%H:%M')}</code>"
-        bot.loop.run_in_executor(None, lambda: tele_bot.send_message(telegram_chat_id, tele_msg, parse_mode="HTML"))
-
-    return jsonify({"success": True, "boss": boss_name, "next_spawn": next_spawn.isoformat()})
-
-@app.route('/api/toggle-web-voice', methods=['POST'])
-def toggle_web_voice():
-    global web_voice_muted
-    with db_lock: # Pastikan akses ke data global aman
-        web_voice_muted = not web_voice_muted
-        save_data()
-    return jsonify({"success": True, "web_voice_muted": web_voice_muted})
-
 
 # ==============================================================================
 # 🚀 CORE ENGINE GATEWAY LIFECYCLE
@@ -1505,16 +1442,6 @@ async def on_ready():
         t = threading.Thread(target=run_telegram_polling, daemon=True)
         t.start()
         telebot_started = True
-
-    # 🚀 Memulai Flask Dashboard di Thread terpisah
-    port = int(os.getenv("PORT", 5000))
-    log.info(f"🌐 Menjalankan Web Dashboard pada port {port}")
-    try:
-        from waitress import serve
-        Thread(target=lambda: serve(app, host='0.0.0.0', port=port), daemon=True).start()
-    except ImportError:
-        log.warning("⚠️ Library 'waitress' tidak ditemukan. Menggunakan server standar.")
-        Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False), daemon=True).start()
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)

@@ -1,8 +1,6 @@
 discord.py
-pyTelegramBotAPI
-Flask
+davey
+PyNaCl
 yt-dlp
 python-dotenv
 psutil
-waitress
-PyNaCl
