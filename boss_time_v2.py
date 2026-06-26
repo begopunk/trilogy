@@ -133,21 +133,33 @@ def get_sheet():
         if _cached_creds is None:
             with _creds_lock:
                 if _cached_creds is None:
-                    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-                        log.error(f"❌ File kredensial tidak ditemukan: {SERVICE_ACCOUNT_FILE}")
-                        return None
-
-                    for attempt in range(10):
+                    # Coba baca dari Environment Variable terlebih dahulu
+                    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+                    if service_account_json:
                         try:
-                            with open(SERVICE_ACCOUNT_FILE, 'r', encoding='utf-8') as f:
-                                info = json.load(f)
+                            info = json.loads(service_account_json)
                             _cached_creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-                            break
-                        except PermissionError:
-                            if attempt < 9:
-                                time.sleep(3)
-                                continue
-                            raise
+                            log.info("🔑 Kredensial Google Sheets berhasil dimuat dari Environment Variable.")
+                        except Exception as e:
+                            log.error(f"❌ Gagal memuat GOOGLE_SERVICE_ACCOUNT_JSON dari env: {e}")
+
+                    # Jika gagal atau tidak ada di env, coba baca dari file fisik
+                    if _cached_creds is None:
+                        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+                            log.error(f"❌ File kredensial tidak ditemukan: {SERVICE_ACCOUNT_FILE}")
+                            return None
+
+                        for attempt in range(10):
+                            try:
+                                with open(SERVICE_ACCOUNT_FILE, 'r', encoding='utf-8') as f:
+                                    info = json.load(f)
+                                _cached_creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+                                break
+                            except PermissionError:
+                                if attempt < 9:
+                                    time.sleep(3)
+                                    continue
+                                raise
 
         client = gspread.authorize(_cached_creds)
         spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
@@ -1630,9 +1642,15 @@ async def auto_update_code():
 async def system_heartbeat():
     """Task rutin untuk memastikan bot masih hidup dan terpantau di Telegram"""
     if telegram_chat_id:
-        # Cek Sisa Disk (e:\)
-        disk = psutil.disk_usage('E:')
-        disk_free = round(disk.free / (1024**3), 2) # GB
+        # Cek Sisa Disk secara cross-platform
+        import platform
+        disk_path = 'E:' if platform.system() == 'Windows' else '/'
+        try:
+            disk = psutil.disk_usage(disk_path)
+            disk_free = round(disk.free / (1024**3), 2) # GB
+        except Exception as e:
+            disk_free = "N/A"
+            log.warning(f"Gagal mengambil info disk: {e}")
         
         waktu_sekarang = datetime.now(TZ_GMT8).strftime("%d-%m %H:%M:%S")
         with db_lock:
