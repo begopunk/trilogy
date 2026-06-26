@@ -5,6 +5,4 @@ yt-dlp
 python-dotenv
 psutil
 waitress
-gspread
-google-auth
 PyNaCl

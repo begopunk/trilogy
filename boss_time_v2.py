@@ -19,8 +19,6 @@ import telebot  # Library Telegram Bot
 import yt_dlp  # Engine Jukebox Pengunduh Musik YouTube
 from dotenv import load_dotenv  # Library untuk membaca file .env
 from threading import Thread
-import gspread
-from google.oauth2.service_account import Credentials
 
 # 📦 IMPORT DATA BOSS DARI FILE TERPISAH
 from boss_data import BOSS_DATA
@@ -123,78 +121,11 @@ _creds_lock = threading.Lock()
 # Cache global untuk kredensial agar tidak terjadi PermissionError karena pembacaan berulang
 _cached_creds = None
 
-def get_sheet():
-    global _cached_creds
-    if not GOOGLE_SHEET_ID:
-        log.error("❌ GOOGLE_SHEET_ID tidak ditemukan di .env")
-        return None
-
-    try:
-        if _cached_creds is None:
-            with _creds_lock:
-                if _cached_creds is None:
-                    # Coba baca dari Environment Variable terlebih dahulu
-                    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-                    if service_account_json:
-                        try:
-                            info = json.loads(service_account_json)
-                            _cached_creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-                            log.info("🔑 Kredensial Google Sheets berhasil dimuat dari Environment Variable.")
-                        except Exception as e:
-                            log.error(f"❌ Gagal memuat GOOGLE_SERVICE_ACCOUNT_JSON dari env: {e}")
-
-                    # Jika gagal atau tidak ada di env, coba baca dari file fisik
-                    if _cached_creds is None:
-                        if not os.path.exists(SERVICE_ACCOUNT_FILE):
-                            log.error(f"❌ File kredensial tidak ditemukan: {SERVICE_ACCOUNT_FILE}")
-                            return None
-
-                        for attempt in range(10):
-                            try:
-                                with open(SERVICE_ACCOUNT_FILE, 'r', encoding='utf-8') as f:
-                                    info = json.load(f)
-                                _cached_creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-                                break
-                            except PermissionError:
-                                if attempt < 9:
-                                    time.sleep(3)
-                                    continue
-                                raise
-
-        client = gspread.authorize(_cached_creds)
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-        return spreadsheet.get_worksheet(0)
-    except gspread.exceptions.SpreadsheetNotFound:
-        log.error(f"❌ Spreadsheet ID tidak ditemukan: {GOOGLE_SHEET_ID}")
-    except gspread.exceptions.APIError as e:
-        log.error(f"❌ API Error Google Sheets: {e}")
-    except PermissionError as e:
-        log.error(f"❌ Permission Error: File '{SERVICE_ACCOUNT_FILE}' sedang dikunci proses lain. {e}")
-    except Exception as e:
-        log.error(f"❌ Gagal terhubung ke Google Sheets: {repr(e)}")
-        return None
-
 def load_data():
     global boss_logs, boss_status, user_timezones, target_channel_id, telegram_chat_id, last_db_mtime, notif_sent, web_voice_muted
     
     data = None
-    # 1. Mencoba muat dari Google Sheets (Prioritas)
-    sheet = get_sheet()
-    if sheet:
-        try:
-            raw_data = sheet.acell('A1').value
-            if raw_data and raw_data.strip():
-                data = json.loads(raw_data)
-                log.info("📊 Database berhasil dimuat dari Google Sheets.")
-            else:
-                # Jika sel A1 kosong, inisialisasi dengan struktur minimal
-                data = {"boss_status": {}, "boss_logs": {}, "user_timezones": {}}
-                log.info("ℹ️ Spreadsheet kosong, memulai dengan database baru.")
-        except Exception as e:
-            log.error(f"⚠️ Gagal memuat data dari Google Sheets: {e}")
-
-    # 2. Fallback ke file lokal jika GSheets gagal atau kosong
-    if not data and os.path.exists(DATA_FILE):
+    if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -242,17 +173,7 @@ def save_data():
         }
         json_string = json.dumps(data_to_save, indent=4, ensure_ascii=False)
 
-        # 1. Simpan ke Google Sheets (Prioritas)
-        sheet = get_sheet()
-        if sheet:
-            try:
-                # Menyimpan seluruh state sebagai JSON di cell A1
-                sheet.update_acell('A1', json_string)
-                log.info("💾 Database berhasil disinkronkan ke Google Sheets.")
-            except Exception as e:
-                log.error(f"⚠️ Gagal sinkronisasi ke Google Sheets: {e}")
-
-        # 2. Selalu simpan ke cadangan lokal untuk keamanan
+        # Selalu simpan ke cadangan lokal untuk keamanan
         with db_lock:
             # Menggunakan temporary file untuk mencegah korupsi data saat crash
             temp_file = DATA_FILE + ".tmp"
@@ -1297,61 +1218,9 @@ def telegram_play(message):
         tele_bot.edit_message_text(f"⚠️ Kesalahan sistem Jukebox: {e}", message.chat.id, status_msg.message_id)
 
 @tele_bot.message_handler(commands=['backup'])
-@tele_bot.message_handler(func=lambda m: m.text == "!backup")
+@tele_bot.message_handler(func=lambda m: m.text == '!backup')
 def telegram_manual_backup(message):
-    """Memicu backup manual ke Google Drive via Telegram."""
-    status_msg = tele_bot.reply_to(message, "☁️ <b>Memulai backup manual ke Google Drive...</b>", parse_mode="HTML") # Pesan status
-    
-    try:
-        # 1. Jalankan rclone copy
-        rclone_result = subprocess.run(
-            [
-                "rclone", "copy", ".", "gdrive:bot-discord/Aria7/",
-                "--exclude", ".env", "--exclude", "*.log", "--exclude", "*.tmp",
-                "--exclude", "music_downloads/**", "--exclude", "old_versions/**"
-            ],
-            capture_output=True, text=True
-        ) # Blocking call, tapi ini di thread Telegram, jadi OK
-
-        if rclone_result.returncode != 0:
-            tele_bot.edit_message_text(
-                f"❌ <b>Backup Gagal!</b>\n<code>{rclone_result.stderr[:500]}</code>", 
-                message.chat.id, status_msg.message_id, parse_mode="HTML"
-            )
-            return
-
-        # 2. Ambil statistik ukuran
-        total_size_bytes = 0
-        size_result = subprocess.run(
-            ["rclone", "size", "gdrive:bot-discord/Aria7/", "--json"], # Blocking call
-            capture_output=True, text=True
-        )
-        if size_result.returncode == 0:
-            try:
-                size_info = json.loads(size_result.stdout)
-                total_size_bytes = size_info.get("bytes", 0)
-            except: pass
-
-        # 3. Format ukuran file
-        size_str = "ukuran tidak diketahui"
-        if total_size_bytes > 0:
-            if total_size_bytes < 1024: size_str = f"{total_size_bytes} B"
-            elif total_size_bytes < 1024 * 1024: size_str = f"{total_size_bytes / 1024:.2f} KB"
-            elif total_size_bytes < 1024 * 1024 * 1024: size_str = f"{total_size_bytes / (1024 * 1024):.2f} MB"
-            else: size_str = f"{total_size_bytes / (1024 * 1024 * 1024):.2f} GB"
-
-        waktu = datetime.now(TZ_GMT8).strftime("%H:%M:%S")
-        res = (
-            f"✅ <b>BACKUP MANUAL BERHASIL</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 <b>Ukuran Total:</b> <code>{size_str}</code>\n"
-            f"👤 <b>Oleh:</b> {message.from_user.first_name}\n"
-            f"⏰ <b>Waktu:</b> <code>{waktu} WITA</code>"
-        )
-        tele_bot.edit_message_text(res, message.chat.id, status_msg.message_id, parse_mode="HTML")
-    except Exception as e:
-        tele_bot.edit_message_text(f"⚠️ <b>Kesalahan Sistem:</b> {e}", message.chat.id, status_msg.message_id, parse_mode="HTML")
-
+    tele_bot.reply_to(message, 'ℹ️ <b>Fitur backup ke Google Drive dinonaktifkan.</b>', parse_mode='HTML')
 @tele_bot.message_handler(commands=['stats'])
 @tele_bot.message_handler(func=lambda m: m.text == "!stats")
 def telegram_stats(message):
@@ -1480,163 +1349,6 @@ async def check_boss_timer():
             if telegram_chat_id:
                 tele_msg = f"🟢 <b>{boss.upper()} SPAWN NOW!</b> 🔥"
                 loop.run_in_executor(None, lambda: tele_bot.send_message(telegram_chat_id, tele_msg, parse_mode="HTML"))
-
-@tasks.loop(minutes=30.0)
-async def backup_to_gdrive():
-    """Task berkala untuk mengunggah database ke Google Drive menggunakan rclone"""
-    async def notify_admin_failure(error_detail):
-        """Helper untuk mengirim notifikasi kegagalan ke channel Discord"""
-        if target_channel_id:
-            channel = bot.get_channel(target_channel_id)
-            if not channel:
-                try: channel = await bot.fetch_channel(target_channel_id)
-                except: return
-            
-            # Mencari role dengan permission administrator untuk mention
-            admin_role = discord.utils.get(channel.guild.roles, permissions=discord.Permissions(administrator=True))
-            mention = admin_role.mention if admin_role else "@administrator"
-            
-            embed = discord.Embed(title="☁️ BACKUP FAILURE ALERT", color=0xff0000, timestamp=datetime.now(TZ_GMT8))
-            embed.description = f"⚠️ {mention}, proses backup ke Google Drive gagal!\n\n**Detail Error:**\n```\n{error_detail}\n```"
-            await channel.send(embed=embed)
-
-    if await asyncio.to_thread(os.path.exists, DATA_FILE): # Blocking call
-        log.info("☁️ Menjalankan backup otomatis ke Google Drive...")
-        try:
-            # Menjalankan rclone copy dan kemudian rclone size di thread terpisah
-            def run_rclone_and_get_remote_size():
-                # Jalankan rclone copy
-                rclone_result = subprocess.run(
-                    [
-                        "rclone", "copy", ".", "gdrive:bot-discord/Aria7/",
-                        "--exclude", ".env", "--exclude", "*.log", "--exclude", "*.tmp",
-                    "--exclude", "music_downloads/**", "--exclude", "old_versions/**",
-                    "--exclude", "service_account.json"
-                    ],
-                    capture_output=True, text=True
-                ) # Blocking call
-
-                total_size_bytes = 0
-                if rclone_result.returncode == 0:
-                    # Jika copy berhasil, dapatkan ukuran total direktori di remote
-                    size_result = subprocess.run(
-                        ["rclone", "size", "gdrive:bot-discord/Aria7/", "--json"],
-                        capture_output=True, text=True
-                    ) # Blocking call
-                    if size_result.returncode == 0:
-                        try:
-                            size_info = json.loads(size_result.stdout)
-                            total_size_bytes = size_info.get("bytes", 0)
-                        except json.JSONDecodeError:
-                            log.error(f"Gagal mengurai JSON dari rclone size: {size_result.stdout}")
-                
-                return rclone_result, total_size_bytes
-            
-            result, backup_size_bytes = await asyncio.to_thread(run_rclone_and_get_remote_size)
-            if result.returncode == 0:
-                log.info("✅ Backup berkala ke Google Drive berhasil.")
-                if telegram_chat_id:
-                    waktu = datetime.now(TZ_GMT8).strftime("%H:%M:%S")
-                    size_str = "ukuran tidak diketahui"
-                    if backup_size_bytes > 0:
-                        if backup_size_bytes < 1024:
-                            size_str = f"{backup_size_bytes} B"
-                        elif backup_size_bytes < 1024 * 1024:
-                            size_str = f"{backup_size_bytes / 1024:.2f} KB"
-                        elif backup_size_bytes < 1024 * 1024 * 1024:
-                            size_str = f"{backup_size_bytes / (1024 * 1024):.2f} MB"
-                        else:
-                            size_str = f"{backup_size_bytes / (1024 * 1024 * 1024):.2f} GB"
-
-                    tele_msg = f"☁️ <b>Backup Berhasil!</b>\n✅ Seluruh data dan kode (<code>{size_str}</code>) telah diamankan ke Google Drive pada pukul <code>{waktu} WITA</code>."
-                    bot.loop.run_in_executor(None, lambda: tele_bot.send_message(telegram_chat_id, tele_msg, parse_mode="HTML"))
-            else:
-                log.error(f"❌ Backup berkala gagal: {result.stderr}")
-                await notify_admin_failure(result.stderr)
-        except Exception as e:
-            log.error(f"⚠️ Gagal mengeksekusi rclone backup: {e}")
-            await notify_admin_failure(str(e))
- 
-@tasks.loop(minutes=5.0)
-async def auto_update_code():
-    """Task untuk menarik update kode dari GDrive dan restart jika ada perubahan"""
-    global last_code_mtime, pending_update_notice, telebot_active
-    try: # Auto-update kode
-        # 1. Simpan isi kode dan changelog sebelum update untuk dibandingkan
-        changelog_file = "changelog.txt"
-        with open(__file__, "r", encoding="utf-8") as f:
-            old_code = f.readlines()
-        
-        old_changelog_content = ""
-        if os.path.exists(changelog_file):
-            with open(changelog_file, "r", encoding="utf-8") as f:
-                old_changelog_content = f.read()
-
-        # 2. Tarik file terbaru dari GDrive
-        def run_sync(): # Blocking call
-            return subprocess.run(
-                ["rclone", "copy", "gdrive:bot-discord/Aria7", ".", 
-                 "--exclude", "bot_data.json", "--exclude", ".env", "--exclude", "*.log", 
-                 "--exclude", "service_account.json", # Kecualikan agar tidak bentrok lock
-                 "--update"],
-                capture_output=True, text=True
-            )
-        
-        await asyncio.to_thread(run_sync) # Jalankan rclone di thread terpisah
-
-        # 3. Cek apakah file script berubah
-        current_mtime = os.path.getmtime(__file__)
-        
-        new_changelog_content = ""
-        if os.path.exists(changelog_file):
-            with open(changelog_file, "r", encoding="utf-8") as f:
-                new_changelog_content = f.read()
-
-        if current_mtime > last_code_mtime:
-            log.info("🔄 Update source code terdeteksi dari GDrive! Melakukan reboot otomatis...")
-            
-            # 📝 AUTO-GENERATE CHANGELOG (Jika changelog di Drive tidak berubah atau kosong)
-            if new_changelog_content == old_changelog_content or not new_changelog_content.strip():
-                with open(__file__, "r", encoding="utf-8") as f:
-                    new_code = f.readlines()
-                
-                # Bandingkan baris
-                diff = list(difflib.unified_diff(old_code, new_code, n=0))
-                added = len([l for l in diff if l.startswith('+') and not l.startswith('+++')])
-                removed = len([l for l in diff if l.startswith('-') and not l.startswith('---')])
-                
-                update_time = datetime.now(TZ_GMT8).strftime("%d-%m-%Y %H:%M:%S")
-                with open(changelog_file, "w", encoding="utf-8") as f:
-                    f.write(f"📅 Update Otomatis: {update_time} WITA\n")
-                    f.write(f"📊 Statistik: +{added} baris baru, -{removed} baris dihapus.\n")
-                    
-                    if diff:
-                        f.write("\n🔍 Cuplikan Perubahan:\n")
-                        # Bersihkan header diff dan ambil 10 baris pertama perubahan
-                        clean_diff = [l for l in diff if not l.startswith(('---', '+++', '@@'))]
-                        f.write("".join(clean_diff[:10]))
-                        if len(clean_diff) > 10:
-                            f.write(f"\n... ({len(clean_diff)-10} baris lainnya)")
-
-            # Tandai bahwa update sedang diproses agar on_ready bisa kirim changelog
-            pending_update_notice = True
-            save_data()
-
-            # Beri notifikasi ke Telegram jika tersedia
-            if telegram_chat_id:
-                tele_bot.send_message(telegram_chat_id, "⚙️ <b>System Update:</b> Versi baru terdeteksi, me-restart bot...", parse_mode="HTML")
-            
-            telebot_active = False
-            # Hentikan polling telegram dengan rapi sebelum restart (blocking)
-            await asyncio.to_thread(tele_bot.stop_polling)
-            await bot.close()
-            # Beri jeda 2 detik agar koneksi benar-benar terputus di sisi server (Cegah Error 409)
-            await asyncio.sleep(2)
-
-            # 3. Restart proses menggunakan script yang baru
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception as e:
-        log.error(f"⚠️ Gagal dalam proses auto-update kode: {e}")
 
 @tasks.loop(hours=6.0)
 async def system_heartbeat():
